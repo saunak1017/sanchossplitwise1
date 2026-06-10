@@ -1,0 +1,89 @@
+CREATE TABLE IF NOT EXISTS users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  email TEXT NOT NULL UNIQUE,
+  password_salt TEXT NOT NULL,
+  password_hash TEXT NOT NULL,
+  role TEXT NOT NULL DEFAULT 'user',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS people (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(user_id, name),
+  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS merchant_rules (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  match_text TEXT NOT NULL,
+  clean_name TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS statements (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  issuer TEXT NOT NULL,
+  title TEXT NOT NULL,
+  period_start TEXT,
+  period_end TEXT,
+  notes TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS transactions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  statement_id INTEGER NOT NULL,
+  transaction_date TEXT,
+  merchant TEXT NOT NULL,
+  original_description TEXT NOT NULL,
+  amount REAL NOT NULL,
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+  FOREIGN KEY(statement_id) REFERENCES statements(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS line_items (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  statement_id INTEGER NOT NULL,
+  transaction_id INTEGER NOT NULL,
+  person_id INTEGER NOT NULL,
+  amount REAL NOT NULL,
+  notes TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+  FOREIGN KEY(statement_id) REFERENCES statements(id) ON DELETE CASCADE,
+  FOREIGN KEY(transaction_id) REFERENCES transactions(id) ON DELETE CASCADE,
+  FOREIGN KEY(person_id) REFERENCES people(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS payments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  person_id INTEGER NOT NULL,
+  payment_date TEXT NOT NULL,
+  type TEXT NOT NULL DEFAULT 'Paid',
+  method TEXT NOT NULL DEFAULT 'Venmo',
+  amount REAL NOT NULL,
+  notes TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+  FOREIGN KEY(person_id) REFERENCES people(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_people_user ON people(user_id);
+CREATE INDEX IF NOT EXISTS idx_statements_user ON statements(user_id);
+CREATE INDEX IF NOT EXISTS idx_transactions_statement ON transactions(statement_id);
+CREATE INDEX IF NOT EXISTS idx_line_items_person ON line_items(user_id, person_id);
+CREATE INDEX IF NOT EXISTS idx_payments_person ON payments(user_id, person_id);
