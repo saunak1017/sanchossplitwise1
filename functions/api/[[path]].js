@@ -148,7 +148,7 @@ async function route(request, env) {
 
   if (parts[0] === 'people') {
     if (method === 'GET') {
-      const rows = await env.DB.prepare('SELECT id, name FROM people WHERE user_id = ? ORDER BY name').bind(user.id).all();
+      const rows = await env.DB.prepare('SELECT id, name, hidden FROM people WHERE user_id = ? ORDER BY name').bind(user.id).all();
       return json({ people: rows.results || [] });
     }
     if (method === 'POST') {
@@ -156,6 +156,43 @@ async function route(request, env) {
       const p = await getOrCreatePerson(env, user.id, body.name);
       return json({ person: p });
     }
+    if (method === 'PATCH' && parts[1]) {
+      const body = await readJson(request);
+      await env.DB.prepare('UPDATE people SET hidden = ? WHERE user_id = ? AND id = ?').bind(body.hidden ? 1 : 0, user.id, parts[1]).run();
+      return json({ ok: true });
+    }
+  }
+
+  if (parts[0] === 'manual-charges' && method === 'POST') {
+    const body = await readJson(request);
+    const amount = Number(body.amount);
+    const description = String(body.description || '').trim();
+    if (!String(body.person || '').trim() || !description || !Number.isFinite(amount) || amount === 0) return json({ error: 'Person, description, and a non-zero amount are required.' }, 400);
+    const person = await getOrCreatePerson(env, user.id, body.person);
+    let statement = await env.DB.prepare("SELECT id FROM statements WHERE user_id = ? AND issuer = 'manual' ORDER BY id LIMIT 1").bind(user.id).first();
+    if (!statement) {
+      statement = await env.DB.prepare("INSERT INTO statements (user_id, issuer, title, notes) VALUES (?, 'manual', 'Manual charges', 'One-off charges added directly from the dashboard') RETURNING id").bind(user.id).first();
+    }
+    const order = await env.DB.prepare('SELECT COALESCE(MAX(sort_order), -1) + 1 AS next_order FROM transactions WHERE user_id = ? AND statement_id = ?').bind(user.id, statement.id).first();
+    const tx = await env.DB.prepare('INSERT INTO transactions (user_id, statement_id, transaction_date, merchant, original_description, amount, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id')
+      .bind(user.id, statement.id, body.charge_date || new Date().toISOString().slice(0, 10), description, description, amount, order.next_order).first();
+    await env.DB.prepare('INSERT INTO line_items (user_id, statement_id, transaction_id, person_id, amount, notes) VALUES (?, ?, ?, ?, ?, ?)')
+      .bind(user.id, statement.id, tx.id, person.id, amount, body.notes || null).run();
+    return json({ ok: true });
+  }
+
+  if (parts[0] === 'reset-data' && method === 'POST') {
+    const body = await readJson(request);
+    if (body.confirm !== 'RESET') return json({ error: 'Type RESET to confirm.' }, 400);
+    await env.DB.batch([
+      env.DB.prepare('DELETE FROM payments WHERE user_id = ?').bind(user.id),
+      env.DB.prepare('DELETE FROM line_items WHERE user_id = ?').bind(user.id),
+      env.DB.prepare('DELETE FROM transactions WHERE user_id = ?').bind(user.id),
+      env.DB.prepare('DELETE FROM statements WHERE user_id = ?').bind(user.id),
+      env.DB.prepare('DELETE FROM merchant_rules WHERE user_id = ?').bind(user.id),
+      env.DB.prepare('DELETE FROM people WHERE user_id = ?').bind(user.id)
+    ]);
+    return json({ ok: true });
   }
 
   if (parts[0] === 'merchant-rules') {
@@ -191,20 +228,34 @@ async function route(request, env) {
     if (method === 'POST') {
       const body = await readJson(request);
       if (!body.title || !body.issuer || !Array.isArray(body.rows)) return json({ error: 'Missing statement data.' }, 400);
+      const normalizedRows = [];
+      for (const row of body.rows) {
+        const originalAmount = Number(row.originalAmount ?? row.amount ?? 0);
+        const sourceItems = Array.isArray(row.lineItems) && row.lineItems.length ? row.lineItems : [{ person: row.person, amount: row.amount }];
+        const items = sourceItems.map(item => ({ ...item, person: String(item.person || '').trim(), amount: Number(item.amount) }));
+        if (!Number.isFinite(originalAmount) || items.some(item => !item.person || !Number.isFinite(item.amount))) {
+          return json({ error: `Every line item for ${row.merchant || 'a transaction'} needs a person and valid amount.` }, 400);
+        }
+        if (items.some(item => item.person.toLowerCase() === 'split')) {
+          return json({ error: '“Split” cannot be used as a person. Assign each split line to the person who owes it.' }, 400);
+        }
+        const uniquePeople = new Set(items.map(item => item.person.toLowerCase()));
+        if (uniquePeople.size !== items.length) return json({ error: `Each person can only appear once in the split for ${row.merchant || 'a transaction'}.` }, 400);
+        const allocated = items.reduce((sum, item) => sum + item.amount, 0);
+        if (Math.abs(originalAmount - allocated) >= 0.005) return json({ error: `The split for ${row.merchant || 'a transaction'} must equal the full charge.` }, 400);
+        normalizedRows.push({ row, originalAmount, items });
+      }
       const statement = await env.DB.prepare('INSERT INTO statements (user_id, issuer, title, period_start, period_end, notes) VALUES (?, ?, ?, ?, ?, ?) RETURNING id')
         .bind(user.id, body.issuer, body.title.trim(), body.period_start || null, body.period_end || null, body.notes || null).first();
       const statementId = statement.id;
-      for (let i = 0; i < body.rows.length; i++) {
-        const row = body.rows[i];
+      for (let i = 0; i < normalizedRows.length; i++) {
+        const { row, originalAmount, items } = normalizedRows[i];
         const tx = await env.DB.prepare('INSERT INTO transactions (user_id, statement_id, transaction_date, merchant, original_description, amount, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id')
-          .bind(user.id, statementId, row.date || null, row.merchant || 'Unknown', row.original || row.merchant || '', Number(row.originalAmount ?? row.amount ?? 0), i).first();
-        const items = Array.isArray(row.lineItems) && row.lineItems.length ? row.lineItems : [{ person: row.person, amount: row.amount }];
+          .bind(user.id, statementId, row.date || null, row.merchant || 'Unknown', row.original || row.merchant || '', originalAmount, i).first();
         for (const item of items) {
-          if (!item.person) continue;
           const p = await getOrCreatePerson(env, user.id, item.person);
-          if (!p) continue;
           await env.DB.prepare('INSERT INTO line_items (user_id, statement_id, transaction_id, person_id, amount, notes) VALUES (?, ?, ?, ?, ?, ?)')
-            .bind(user.id, statementId, tx.id, p.id, Number(item.amount || 0), item.notes || null).run();
+            .bind(user.id, statementId, tx.id, p.id, item.amount, item.notes || null).run();
         }
       }
       return json({ id: statementId });
@@ -254,7 +305,7 @@ async function route(request, env) {
   }
 
   if (parts[0] === 'dashboard' && method === 'GET') {
-    const people = await env.DB.prepare('SELECT id, name FROM people WHERE user_id = ? ORDER BY name').bind(user.id).all();
+    const people = await env.DB.prepare('SELECT id, name, hidden FROM people WHERE user_id = ? ORDER BY name').bind(user.id).all();
     const assigned = await env.DB.prepare(`
       SELECT p.id AS person_id, COALESCE(SUM(li.amount),0) AS assigned
       FROM people p LEFT JOIN line_items li ON li.person_id = p.id AND li.user_id = p.user_id
